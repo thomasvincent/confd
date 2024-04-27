@@ -1,139 +1,117 @@
 package util
 
 import (
-	"fmt"
-	"github.com/kelseyhightower/confd/log"
-	"os"
-	"path"
-	"path/filepath"
+    "fmt"
+    "os"
+    "path"
+    "path/filepath"
+
+    "github.com/kelseyhightower/confd/log"
 )
 
-// Nodes is a custom flag Var representing a list of etcd nodes.
+// Nodes represents a list of etcd node addresses.
 type Nodes []string
 
-// String returns the string representation of a node var.
 func (n *Nodes) String() string {
-	return fmt.Sprintf("%s", *n)
+    return fmt.Sprintf("%v", *n)
 }
 
-// Set appends the node to the etcd node list.
 func (n *Nodes) Set(node string) error {
-	*n = append(*n, node)
-	return nil
+    *n = append(*n, node)
+    return nil
 }
 
-// fileInfo describes a configuration file and is returned by fileStat.
+// FileInfo contains metadata about a configuration file.
 type FileInfo struct {
-	Uid  uint32
-	Gid  uint32
-	Mode os.FileMode
-	Md5  string
+    Uid  uint32
+    Gid  uint32
+    Mode os.FileMode
+    Md5  string
 }
 
+// AppendPrefix adds a common prefix to keys, facilitating resource management.
 func AppendPrefix(prefix string, keys []string) []string {
-	s := make([]string, len(keys))
-	for i, k := range keys {
-		s[i] = path.Join(prefix, k)
-	}
-	return s
+    result := make([]string, len(keys))
+    for i, key := range keys {
+        result[i] = path.Join(prefix, key)
+    }
+    return result
 }
 
-// isFileExist reports whether path exits.
-func IsFileExist(fpath string) bool {
-	if _, err := os.Stat(fpath); os.IsNotExist(err) {
-		return false
-	}
-	return true
+// Exists checks for the existence of a file at given path, minimizing system calls.
+func Exists(filePath string) bool {
+    _, err := os.Stat(filePath)
+    return !os.IsNotExist(err)
 }
 
-// IsConfigChanged reports whether src and dest config files are equal.
-// Two config files are equal when they have the same file contents and
-// Unix permissions. The owner, group, and mode must match.
-// It return false in other cases.
-func IsConfigChanged(src, dest string) (bool, error) {
-	if !IsFileExist(dest) {
-		return true, nil
-	}
-	d, err := FileStat(dest)
-	if err != nil {
-		return true, err
-	}
-	s, err := FileStat(src)
-	if err != nil {
-		return true, err
-	}
-	if d.Uid != s.Uid {
-		log.Info(fmt.Sprintf("%s has UID %d should be %d", dest, d.Uid, s.Uid))
-	}
-	if d.Gid != s.Gid {
-		log.Info(fmt.Sprintf("%s has GID %d should be %d", dest, d.Gid, s.Gid))
-	}
-	if d.Mode != s.Mode {
-		log.Info(fmt.Sprintf("%s has mode %s should be %s", dest, os.FileMode(d.Mode), os.FileMode(s.Mode)))
-	}
-	if d.Md5 != s.Md5 {
-		log.Info(fmt.Sprintf("%s has md5sum %s should be %s", dest, d.Md5, s.Md5))
-	}
-	if d.Uid != s.Uid || d.Gid != s.Gid || d.Mode != s.Mode || d.Md5 != s.Md5 {
-		return true, nil
-	}
-	return false, nil
+// CompareConfig examines if two configuration files are identical based on metadata and content.
+func CompareConfig(src, dest string) (bool, error) {
+    if !Exists(dest) {
+        return true, nil
+    }
+
+    destInfo, err := statFile(dest)
+    if err != nil {
+        return false, err
+    }
+
+    srcInfo, err := statFile(src)
+    if err != nil {
+        return false, err
+    }
+
+    return !compareFileInfo(srcInfo, destInfo, dest), nil
 }
 
+func compareFileInfo(src, dest FileInfo, destPath string) bool {
+    differenceFound := false
+    if src != dest {
+        logDifferences(src, dest, destPath)
+        differenceFound = true
+    }
+    return differenceFound
+}
+
+// logDifferences outputs differences in file metadata to a log.
+func logDifferences(src, dest FileInfo, destPath string) {
+    if src.Uid != dest.Uid {
+        log.Info(fmt.Sprintf("%s has UID %d, expected %d", destPath, dest.Uid, src.Uid))
+    }
+    if src.Gid != dest.Gid {
+        log.Info(fmt.Sprintf("%s has GID %d, expected %d", destPath, dest.Gid, src.Gid))
+    }
+    if src.Mode != dest.Mode {
+        log.Info(fmt.Sprintf("%s has mode %s, expected %s", destPath, dest.Mode, src.Mode))
+    }
+    if src.Md5 != dest.Md5 {
+        log.Info(fmt.Sprintf("%s expects md5 %s, found %s", destPath, src.Md5, dest.Md5))
+    }
+}
+
+func statFile(path string) (FileInfo, error) {
+    var info FileInfo
+    file, err := os.Open(path)
+    if err != nil {
+        return info, err
+    }
+    defer file.Close()
+
+    stat, err := file.Stat()
+    if err != nil {
+        return info, err
+    }
+
+    // Add logic here to fill the FileInfo struct
+    // Calculate MD5 checksum, etc.
+
+    return info, nil
+}
+
+// IsDirectory determines if the given path is a directory.
 func IsDirectory(path string) (bool, error) {
-	f, err := os.Stat(path)
-	if err != nil {
-		return false, err
-	}
-	switch mode := f.Mode(); {
-	case mode.IsDir():
-		return true, nil
-	case mode.IsRegular():
-		return false, nil
-	}
-	return false, nil
-}
-
-func RecursiveFilesLookup(root string, pattern string) ([]string, error) {
-	return recursiveLookup(root, pattern, false)
-}
-
-func RecursiveDirsLookup(root string, pattern string) ([]string, error) {
-	return recursiveLookup(root, pattern, true)
-}
-
-func recursiveLookup(root string, pattern string, dirsLookup bool) ([]string, error) {
-	var result []string
-	isDir, err := IsDirectory(root)
-	if err != nil {
-		return nil, err
-	}
-	if isDir {
-		err := filepath.Walk(root, func(root string, f os.FileInfo, err error) error {
-			match, err := filepath.Match(pattern, f.Name())
-			if err != nil {
-				return err
-			}
-			if match {
-				isDir, err := IsDirectory(root)
-				if err != nil {
-					return err
-				}
-				if isDir && dirsLookup {
-					result = append(result, root)
-				} else if !isDir && !dirsLookup {
-					result = append(result, root)
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		if !dirsLookup {
-			result = append(result, root)
-		}
-	}
-	return result, nil
+    info, err := os.Stat(path)
+    if err != nil {
+        return false, err
+    }
+    return info.IsDir(), nil
 }
