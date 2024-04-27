@@ -24,44 +24,36 @@ type StoreClient interface {
 	WatchPrefix(prefix string, keys []string, waitIndex uint64, stopChan chan bool) (uint64, error)
 }
 
+const (
+	defaultBackend = "etcd"
+)
+
 // New is used to create a storage client based on our configuration.
 func New(config Config) (StoreClient, error) {
-
 	if config.Backend == "" {
-		config.Backend = "etcd"
+		config.Backend = defaultBackend
 	}
-	backendNodes := config.BackendNodes
 
-	if config.Backend == "file" {
-		log.Info("Backend source(s) set to " + strings.Join(config.YAMLFile, ", "))
-	} else {
-		log.Info("Backend source(s) set to " + strings.Join(backendNodes, ", "))
-	}
+	log.Infof("Backend set to '%s'", config.Backend)
+
+	var client StoreClient
+	var err error
 
 	switch config.Backend {
 	case "consul":
-		return consul.New(config.BackendNodes, config.Scheme,
-			config.ClientCert, config.ClientKey,
-			config.ClientCaKeys,
-			config.BasicAuth,
-			config.Username,
-			config.Password,
-		)
-	case "etcd":
-		// etcd v2 has been deprecated and etcdv3 is now the client for both the etcd and etcdv3 backends.
-		return etcdv3.NewEtcdClient(backendNodes, config.ClientCert, config.ClientKey, config.ClientCaKeys, config.BasicAuth, config.Username, config.Password)
-	case "etcdv3":
-		return etcdv3.NewEtcdClient(backendNodes, config.ClientCert, config.ClientKey, config.ClientCaKeys, config.BasicAuth, config.Username, config.Password)
+		client, err = consul.New(config.BackendNodes, config.Scheme, config.ClientCert, config.ClientKey, config.ClientCaKeys, config.BasicAuth, config.Username, config.Password)
+	case "etcd", "etcdv3":
+		client, err = etcdv3.NewEtcdClient(config.BackendNodes, config.ClientCert, config.ClientKey, config.ClientCaKeys, config.BasicAuth, config.Username, config.Password)
 	case "zookeeper":
-		return zookeeper.NewZookeeperClient(backendNodes)
+		client, err = zookeeper.NewZookeeperClient(config.BackendNodes)
 	case "rancher":
-		return rancher.NewRancherClient(backendNodes)
+		client, err = rancher.NewRancherClient(config.BackendNodes)
 	case "redis":
-		return redis.NewRedisClient(backendNodes, config.ClientKey, config.Separator)
+		client, err = redis.NewRedisClient(config.BackendNodes, config.ClientKey, config.Separator)
 	case "env":
-		return env.NewEnvClient()
+		client, err = env.NewEnvClient()
 	case "file":
-		return file.NewFileClient(config.YAMLFile, config.Filter)
+		client, err = file.NewFileClient(config.YAMLFile, config.Filter)
 	case "vault":
 		vaultConfig := map[string]string{
 			"app-id":    config.AppID,
@@ -72,17 +64,23 @@ func New(config Config) (StoreClient, error) {
 			"password":  config.Password,
 			"token":     config.AuthToken,
 			"cert":      config.ClientCert,
-			"key":       config.ClientKey,
+			"key":       config\ClientKey,
 			"caCert":    config.ClientCaKeys,
 			"path":      config.Path,
 		}
-		return vault.New(backendNodes[0], config.AuthType, vaultConfig)
+		client, err = vault.New(config.BackendNodes[0], config.AuthType, vaultConfig)
 	case "dynamodb":
-		table := config.Table
-		log.Info("DynamoDB table set to " + table)
-		return dynamodb.NewDynamoDBClient(table)
+		log.Infof("DynamoDB table set to '%s'", config.Table)
+		client, err = dynamodb.NewDynamoDBClient(config.Table)
 	case "ssm":
-		return ssm.New()
+		client, err = ssm.New()
+	default:
+		return nil, errors.New("Invalid backend")
 	}
-	return nil, errors.New("Invalid backend")
+
+	if err != nil {
+		return nil, err
+	}
+
+	return client, nil
 }
