@@ -1,21 +1,21 @@
 package consul
 
 import (
+	"context"
 	"path"
 	"strings"
 
 	"github.com/hashicorp/consul/api"
 )
 
-// Client provides a wrapper around the consulkv client
+// ConsulClient is a wrapper around the Consul KV client
 type ConsulClient struct {
 	client *api.KV
 }
 
-// NewConsulClient returns a new client to Consul for the given address
-func New(nodes []string, scheme, cert, key, caCert string, basicAuth bool, username string, password string) (*ConsulClient, error) {
+// NewConsulClient creates a new Consul client
+func NewConsulClient(ctx context.Context, nodes []string, scheme, cert, key, caCert string, basicAuth bool, username string, password string) (*ConsulClient, error) {
 	conf := api.DefaultConfig()
-
 	conf.Scheme = scheme
 
 	if len(nodes) > 0 {
@@ -44,34 +44,37 @@ func New(nodes []string, scheme, cert, key, caCert string, basicAuth bool, usern
 	return &ConsulClient{client.KV()}, nil
 }
 
-// GetValues queries Consul for keys
-func (c *ConsulClient) GetValues(keys []string) (map[string]string, error) {
-	vars := make(map[string]string)
-	for _, key := range keys {
-		key := strings.TrimPrefix(key, "/")
-		pairs, _, err := c.client.List(key, nil)
-		if err != nil {
-			return vars, err
-		}
-		for _, p := range pairs {
-			vars[path.Join("/", p.Key)] = string(p.Value)
-		}
+// GetValue queries Consul for a single key
+func (c *ConsulClient) GetValue(ctx context.Context, key string) (string, error) {
+	key = strings TrimPrefix(key, "/")
+	pair, _, err := c.client.Get(ctx, key, nil)
+	if err != nil {
+		return "", err
 	}
-	return vars, nil
+	return string(pair.Value), nil
 }
 
-type watchResponse struct {
-	waitIndex uint64
-	err       error
+// GetValues queries Consul for multiple keys
+func (c *ConsulClient) GetValues(ctx context.Context, keys []string) (map[string]string, error) {
+	values := make(map[string]string)
+	for _, key := range keys {
+		value, err := c.GetValue(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		values[key] = value
+	}
+	return values, nil
 }
 
-func (c *ConsulClient) WatchPrefix(prefix string, keys []string, waitIndex uint64, stopChan chan bool) (uint64, error) {
+// WatchPrefix watches a Consul prefix for changes
+func (c *ConsulClient) WatchPrefix(ctx context.Context, prefix string, waitIndex uint64, stopChan chan bool) (uint64, error) {
 	respChan := make(chan watchResponse)
 	go func() {
-		opts := api.QueryOptions{
+	 opts := api.QueryOptions{
 			WaitIndex: waitIndex,
 		}
-		_, meta, err := c.client.List(prefix, &opts)
+		_, meta, err := c.client.List(ctx, prefix, &opts)
 		if err != nil {
 			respChan <- watchResponse{waitIndex, err}
 			return
@@ -85,4 +88,9 @@ func (c *ConsulClient) WatchPrefix(prefix string, keys []string, waitIndex uint6
 	case r := <-respChan:
 		return r.waitIndex, r.err
 	}
+}
+
+type watchResponse struct {
+	waitIndex uint64
+	err       error
 }
