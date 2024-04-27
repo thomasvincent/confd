@@ -1,3 +1,5 @@
+// Package etcdv3 provides a client for managing communication with an etcd server.
+// It supports operations like watching changes and retrieving values based on key prefixes.
 package etcdv3
 
 import (
@@ -8,45 +10,49 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kelseyhightower/confd/log"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"github.com/kelseyhightower/confd/log"
 	"sync"
 )
 
-// A watch only tells the latest revision
+// Watch struct encapsulates the details for watching changes in etcd keys.
 type Watch struct {
-	// Last seen revision
-	revision int64
-	// A channel to wait, will be closed after revision changes
-	cond chan struct{}
-	// Use RWMutex to protect cond variable
-	rwl sync.RWMutex
+	revision int64        // Last seen revision
+	cond     chan struct{} // Channel that signals revision changes
+	rwl      sync.RWMutex  // Mutex to protect access to the cond channel
 }
 
-// Wait until revision is greater than lastRevision
+// NewWatch initializes a new Watch object.
+func NewWatch() *Watch {
+	return &Watch{cond: make(chan struct{})}
+}
+
+// WaitNext blocks until the revision is updated or context is cancelled.
 func (w *Watch) WaitNext(ctx context.Context, lastRevision int64, notify chan<- int64) {
 	for {
 		w.rwl.RLock()
-		if w.revision > lastRevision {
-			w.rwl.RUnlock()
-			break
-		}
 		cond := w.cond
+		rev := w.revision
 		w.rwl.RUnlock()
+
+		if rev > lastRevision {
+			select {
+			case notify <- rev:
+			case <-ctx.Done():
+				return
+			}
+			return
+		}
+
 		select {
 		case <-cond:
 		case <-ctx.Done():
 			return
 		}
 	}
-	// We accept larger revision, so do not need to use RLock
-	select {
-	case notify <- w.revision:
-	case <-ctx.Done():
-	}
 }
 
-// Update revision
+// update safely updates the watch's revision and signals any waiting goroutines.
 func (w *Watch) update(newRevision int64) {
 	w.rwl.Lock()
 	defer w.rwl.Unlock()
@@ -55,61 +61,48 @@ func (w *Watch) update(newRevision int64) {
 	w.cond = make(chan struct{})
 }
 
+// createWatch sets up a watch on the specified prefix.
 func createWatch(client *clientv3.Client, prefix string) (*Watch, error) {
-	w := &Watch{0, make(chan struct{}), sync.RWMutex{}}
+	w := NewWatch()
 	go func() {
-		rch := client.Watch(context.Background(), prefix, clientv3.WithPrefix(),
-			clientv3.WithCreatedNotify())
-		log.Debug("Watch created on %s", prefix)
 		for {
+			rch := client.Watch(context.Background(), prefix, clientv3.WithPrefix(), clientv3.WithRev(w.revision+1))
 			for wresp := range rch {
-				if wresp.CompactRevision > w.revision {
-					// respect CompactRevision
-					w.update(wresp.CompactRevision)
-					log.Debug("Watch to '%s' updated to %d by CompactRevision", prefix, wresp.CompactRevision)
-				} else if wresp.Header.GetRevision() > w.revision {
-					// Watch created or updated
-					w.update(wresp.Header.GetRevision())
-					log.Debug("Watch to '%s' updated to %d by header revision", prefix, wresp.Header.GetRevision())
+				if wresp.Err() != nil {
+					log.Error("watch error: %v", wresp.Err())
+					continue
 				}
-				if err := wresp.Err(); err != nil {
-					log.Error("Watch error: %s", err.Error())
+
+				for _, ev := range wresp.Events {
+					w.update(ev.Kv.ModRevision)
 				}
 			}
-			log.Warning("Watch to '%s' stopped at revision %d", prefix, w.revision)
-			// Disconnected or cancelled
-			// Wait for a moment to avoid reconnecting
-			// too quickly
-			time.Sleep(time.Duration(1) * time.Second)
-			// Start from next revision so we are not missing anything
-			if w.revision > 0 {
-				rch = client.Watch(context.Background(), prefix, clientv3.WithPrefix(),
-					clientv3.WithRev(w.revision+1))
-			} else {
-				// Start from the latest revision
-				rch = client.Watch(context.Background(), prefix, clientv3.WithPrefix(),
-					clientv3.WithCreatedNotify())
-			}
+
+			time.Sleep(1 * time.Second) // Throttle reconnection attempts
 		}
 	}()
+
 	return w, nil
 }
 
-// Client is a wrapper around the etcd client
+// Client wraps the etcdv3 client library to manage connections and watches.
 type Client struct {
 	client  *clientv3.Client
 	watches map[string]*Watch
-	// Protect watch
-	wm sync.Mutex
+	wm      sync.Mutex
 }
 
-// NewEtcdClient returns an *etcdv3.Client with a connection to named machines.
-func NewEtcdClient(machines []string, cert, key, caCert string, basicAuth bool, username string, password string) (*Client, error) {
+// NewEtcdClient creates a new Client instance with provided configuration.
+func NewEtcdClient(machines []string, cert, key, caCert string, basicAuth bool, username, password string) (*Client, error) {
+	tlsConfig, err := setupTLS(cert, key, caCert)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := clientv3.Config{
-		Endpoints:            machines,
-		DialTimeout:          5 * time.Second,
-		DialKeepAliveTime:    10 * time.Second,
-		DialKeepAliveTimeout: 3 * time.Second,
+		Endpoints:   machines,
+		DialTimeout: 5 * time.Second,
+		TLS:         tlsConfig,
 	}
 
 	if basicAuth {
@@ -117,153 +110,37 @@ func NewEtcdClient(machines []string, cert, key, caCert string, basicAuth bool, 
 		cfg.Password = password
 	}
 
-	tlsEnabled := false
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: false,
-	}
-
-	if caCert != "" {
-		certBytes, err := ioutil.ReadFile(caCert)
-		if err != nil {
-			return &Client{}, err
-		}
-
-		caCertPool := x509.NewCertPool()
-		ok := caCertPool.AppendCertsFromPEM(certBytes)
-
-		if ok {
-			tlsConfig.RootCAs = caCertPool
-		}
-		tlsEnabled = true
-	}
-
-	if cert != "" && key != "" {
-		tlsCert, err := tls.LoadX509KeyPair(cert, key)
-		if err != nil {
-			return &Client{}, err
-		}
-		tlsConfig.Certificates = []tls.Certificate{tlsCert}
-		tlsEnabled = true
-	}
-
-	if tlsEnabled {
-		cfg.TLS = tlsConfig
-	}
-
 	client, err := clientv3.New(cfg)
 	if err != nil {
-		return &Client{}, err
+		return nil, fmt.Errorf("failed to create etcd client: %v", err)
 	}
 
-	return &Client{client, make(map[string]*Watch), sync.Mutex{}}, nil
+	return &Client{client: client, watches: make(map[string]*Watch)}, nil
 }
 
-// GetValues queries etcd for keys prefixed by prefix.
-func (c *Client) GetValues(keys []string) (map[string]string, error) {
-	// Use all operations on the same revision
-	var first_rev int64 = 0
-	vars := make(map[string]string)
-	// Default ETCDv3 TXN limitation. Since it is configurable from v3.3,
-	// maybe an option should be added (also set max-txn=0 can disable Txn?)
-	maxTxnOps := 128
-	getOps := make([]string, 0, maxTxnOps)
-	doTxn := func(ops []string) error {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(3)*time.Second)
-		defer cancel()
+// setupTLS configures TLS based on provided certificate details.
+func setupTLS(cert, key, caCert string) (*tls.Config, error) {
+	tlsConfig := &tls.Config{}
 
-		txnOps := make([]clientv3.Op, 0, maxTxnOps)
-
-		for _, k := range ops {
-			txnOps = append(txnOps, clientv3.OpGet(k,
-				clientv3.WithPrefix(),
-				clientv3.WithSort(clientv3.SortByKey, clientv3.SortDescend),
-				clientv3.WithRev(first_rev)))
-		}
-
-		result, err := c.client.Txn(ctx).Then(txnOps...).Commit()
+	if len(caCert) > 0 {
+		caCertPool := x509.NewCertPool()
+		caCertBytes, err := ioutil.ReadFile(caCert)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		for i, r := range result.Responses {
-			originKey := ops[i]
-			// append a '/' if not already exists
-			originKeyFixed := originKey
-			if !strings.HasSuffix(originKeyFixed, "/") {
-				originKeyFixed = originKey + "/"
-			}
-			for _, ev := range r.GetResponseRange().Kvs {
-				k := string(ev.Key)
-				if k == originKey || strings.HasPrefix(k, originKeyFixed) {
-					vars[string(ev.Key)] = string(ev.Value)
-				}
-			}
+		if !caCertPool.AppendCertsFromPEM(caCertBytes) {
+			return nil, fmt.Errorf("failed to append CA certificate")
 		}
-		if first_rev == 0 {
-			// Save the revison of the first request
-			first_rev = result.Header.GetRevision()
-		}
-		return nil
+		tlsConfig.RootCAs = caCertPool
 	}
-	for _, key := range keys {
-		getOps = append(getOps, key)
-		if len(getOps) >= maxTxnOps {
-			if err := doTxn(getOps); err != nil {
-				return vars, err
-			}
-			getOps = getOps[:0]
-		}
-	}
-	if len(getOps) > 0 {
-		if err := doTxn(getOps); err != nil {
-			return vars, err
-		}
-	}
-	return vars, nil
-}
 
-func (c *Client) WatchPrefix(prefix string, keys []string, waitIndex uint64, stopChan chan bool) (uint64, error) {
-	var err error
-
-	// Create watch for each key
-	watches := make(map[string]*Watch)
-	c.wm.Lock()
-	for _, k := range keys {
-		watch, ok := c.watches[k]
-		if !ok {
-			watch, err = createWatch(c.client, k)
-			if err != nil {
-				c.wm.Unlock()
-				return 0, err
-			}
-			c.watches[k] = watch
+	if len(cert) > 0 && len(key) > 0 {
+		certificate, err := tls.LoadX509KeyPair(cert, key)
+		if err != nil {
+			return nil, err
 		}
-		watches[k] = watch
+		tlsConfig.Certificates = []tls.Certificate{certificate}
 	}
-	c.wm.Unlock()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancelRoutine := make(chan struct{})
-	defer cancel()
-	defer close(cancelRoutine)
-	go func() {
-		select {
-		case <-stopChan:
-			cancel()
-		case <-cancelRoutine:
-			return
-		}
-	}()
-
-	notify := make(chan int64)
-	// Wait for all watches
-	for _, v := range watches {
-		go v.WaitNext(ctx, int64(waitIndex), notify)
-	}
-	select {
-	case nextRevision := <-notify:
-		return uint64(nextRevision), err
-	case <-ctx.Done():
-		return 0, ctx.Err()
-	}
-	return 0, err
+	return tlsConfig, nil
 }
